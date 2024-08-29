@@ -22,6 +22,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from PIL import Image
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -83,9 +85,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+        #gt_image = viewpoint_cam.original_image.cuda(non_blocking=True)
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        #changeFlag
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -153,6 +158,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+# 保存图像的函数
+def save_image(image, path):
+    # 将图像从 GPU 移到 CPU，并转换为 uint8 类型
+    image_cpu = (image.permute(1, 2, 0).contiguous().cpu().numpy() * 255).astype(np.uint8)
+    # 使用 PIL 保存图像
+    img_pil = Image.fromarray(image_cpu)
+    img_pil.save(path)
+
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -165,6 +178,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        test_output_dir= os.path.join(args.model_path,"img","iter_"+str(iteration))
+        if not os.path.exists(test_output_dir):
+            os.makedirs(test_output_dir, exist_ok = True)
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
@@ -172,6 +188,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+
+                    # 保存渲染图像
+                    render_image_path = os.path.join(test_output_dir,
+                                                     f"{config['name']}_{viewpoint.image_name}_render_{iteration}.png")
+                    save_image(image, render_image_path)
+                    # 保存地面真值图像
+                    gt_image_path = os.path.join(test_output_dir,
+                                                 f"{config['name']}_{viewpoint.image_name}_gt_{iteration}.png")
+                    save_image(gt_image, gt_image_path)
+
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
@@ -200,8 +226,11 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    #parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    # parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000])
+    # parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 2_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 2_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

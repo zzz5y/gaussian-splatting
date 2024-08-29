@@ -22,6 +22,8 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import os,imageio
+import imageio.v2 as imageio
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -254,7 +256,251 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+
+def readKitti360Info(datadir, white_background=False, eval=False, factor=8):
+    """
+    Read and process KITTI-360 dataset into a format compatible with the 3DGS framework.
+
+    Args:
+        datadir (str): Directory containing the KITTI-360 data.
+        white_background (bool): If True, sets background to white.
+        eval (bool): If True, separates cameras into training and testing sets.
+        factor (int): Downsampling factor for images.
+
+    Returns:
+        SceneInfo: A NamedTuple containing point cloud, train/test camera info, nerf normalization, and ply path.
+    """
+
+    # Load the data
+    print("Loading KITTI-360 data...")
+    poses, imgs, render_pose, img_shape, i_test = load_kitti360_data(datadir, factor)
+    height, width, focal = img_shape
+
+    # Initialize camera information
+    cam_infos = []
+    for idx, (pose, img) in enumerate(zip(poses, imgs)):
+        # Convert pose to rotation (R) and translation (T)
+        w2c = pose
+        R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
+        T = w2c[:3, 3]
+
+        # Load and preprocess the image
+        image = Image.fromarray((img * 255).astype(np.uint8))
+
+        # Set background color
+        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+        norm_data = np.array(image.convert("RGBA")) / 255.0
+        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+        image = Image.fromarray((arr * 255.0).astype(np.uint8), "RGB")
+
+        # Calculate FOV from focal length and image dimensions
+        fovx = focal2fov(focal, width)
+        fovy = focal2fov(focal, height)
+
+        cam_info = CameraInfo(
+            uid=idx,
+            R=R,
+            T=T,
+            FovY=fovy,
+            FovX=fovx,
+            image=image,
+            image_path="",
+            image_name=f"kitti360_{idx:04d}",
+            width=width,
+            height=height
+        )
+        cam_infos.append(cam_info)
+
+    # Separate train and test cameras if evaluation mode is enabled
+    if eval:
+        train_cam_infos = [cam for i, cam in enumerate(cam_infos) if i not in i_test]
+        test_cam_infos = [cam for i, cam in enumerate(cam_infos) if i in i_test]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    # Get normalization for NeRF++ training
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # Generate random point cloud since KITTI-360 data doesn't include one by default
+    ply_path = os.path.join(datadir, "points3d.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    # Return SceneInfo
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path
+    )
+
+    return scene_info
+
+'''
+Output: images, poses, bds, render_pose, itest;
+
+poses (是指的 c2w 的pose)
+'''
+
+def load_kitti360_data(datadir, factor=8):
+    poses, imgs, K, i_test =_load_data(datadir)
+    H,W = imgs.shape[1:3]
+    focal = K[0][0]
+
+    ## 设第一张相机的Pose 是单位矩阵，对其他相机的Pose 需要进行调整为相对于第一帧的Pose 相对位姿
+    poses = Normailize_T(poses)   ## 对于 平移translation 进行归一化
+
+    render_pose = np.stack(poses[i] for i in i_test)
+
+    return poses,imgs,render_pose,[H,W,focal],i_test
+
+
+def _load_data(datadir,end_iterion=424,sequence ='2013_05_28_drive_0000_sync'):
+    '''Load intrinstic matrix'''
+    intrinstic_file = os.path.join(os.path.join(datadir, 'calibration'), 'perspective.txt')
+    with open(intrinstic_file) as f:
+        lines = f.readlines()
+        for line in lines:
+            lineData = line.strip().split()
+            if lineData[0] == 'P_rect_00:':
+                K_00 = np.array(lineData[1:]).reshape(3,4).astype(np.float64)
+            elif lineData[0] == 'P_rect_01:':
+                K_01 = np.array(lineData[1:]).reshape(3,4).astype(np.float64)
+            elif lineData[0] == 'R_rect_01:':
+                R_rect_01 = np.eye(4)
+                R_rect_01[:3,:3] = np.array(lineData[1:]).reshape(3,3).astype(np.float64)
+
+    '''Load extrinstic matrix'''
+    CamPose_00 = {}
+    CamPose_01 = {}
+    extrinstic_file = os.path.join(datadir,os.path.join('data_poses',sequence))
+    cam2world_file_00 = os.path.join(extrinstic_file,'cam0_to_world.txt')
+    pose_file = os.path.join(extrinstic_file,'poses.txt')
+
+
+    ''' Camera_00  to world coordinate '''
+    with open(cam2world_file_00,'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            lineData = list(map(float,line.strip().split()))
+            CamPose_00[lineData[0]] = np.array(lineData[1:]).reshape(4,4)
+
+    ''' Camera_01 to world coordiante '''
+    CamToPose_01 = loadCameraToPose(os.path.join(os.path.join(datadir, 'calibration'),'calib_cam_to_pose.txt'))
+    poses = np.loadtxt(pose_file)
+    frames = poses[:, 0]
+    poses = np.reshape(poses[:, 1:], [-1, 3, 4])
+    for frame, pose in zip(frames, poses):
+        pose = np.concatenate((pose, np.array([0., 0., 0., 1.]).reshape(1, 4)))
+        pp = np.matmul(pose, CamToPose_01)
+        CamPose_01[frame] = np.matmul(pp, np.linalg.inv(R_rect_01))
+
+
+
+    ''' Load corrlected images camera 00--> index    camera 01----> index+1'''
+    def imread(f):
+        if f.endswith('png'):
+            #return imageio.imread(f, ignoregamma=True)
+            return imageio.imread(f, format="PNG-PIL", ignoregamma=True)
+        else:
+            #return imageio.imread(f)
+            return imageio.imread(f, format="PNG-PIL", ignoregamma=True)
+    imgae_dir = os.path.join(datadir,sequence)
+    image_00 = os.path.join(imgae_dir,'image_00/data_rect')
+    image_01 = os.path.join(imgae_dir,'image_01/data_rect')
+
+    start_index = 2100
+    #num = 8
+    num = 200
+    all_images = []
+    all_poses = []
+
+    for idx in range(start_index,start_index+num,1):
+        ## read image_00
+        image = imread(os.path.join(image_00,"{:010d}.png").format(idx))/255.0
+        all_images.append(image)
+        all_poses.append(CamPose_00[idx])
+
+        ## read image_01
+        image = imread(os.path.join(image_01, "{:010d}.png").format(idx))/255.0
+        all_images.append(image)
+        all_poses.append(CamPose_01[idx])
+    #
+    # imga_file = [os.path.join(imgae_dir,f"{'%010d'% idx}.png") for idx in imgs_idx ]  ##"010d“ 将 idx前面补成10位
+    # # length = len(imga_file)
+    # imgs = [imread(f)[...,:3]/255. for f in imga_file]
+    # for i,idx in enumerate(imgs_idx):
+    #     cv.imwrite(f"train/{'%010d'% idx}.png", imgs[i] * 255)
+
+    imgs = np.stack(all_images,-1)
+    imgs = np.moveaxis(imgs, -1, 0)
+    c2w = np.stack(all_poses)
+
+    '''Generate test file'''
+    #i_test = np.array([4,10])
+
+    # # 获取 all_images 的长度
+    # n = len(all_images)
+    #
+    # # 创建一个包含所有索引的列表
+    # indices = list(range(n))
+    #
+    # # 从索引列表中随机选择 30 个不重复的索引
+    # selected_indices = random.sample(indices, min(30, n))
+    #
+    # # 根据选中的索引获取元素
+    # i_test = sorted(selected_indices)
+
+    #i_test =[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57, 59]
+    i_test = [i for i in range(200) if i % 2 == 0]
+    return c2w,imgs, K_00,i_test
+
+def Normailize_T(poses):
+    for i,pose in enumerate(poses):
+        if i == 0:
+            inv_pose = np.linalg.inv(pose)
+            poses[i] = np.eye(4)
+        else:
+            poses[i] = np.dot(inv_pose,poses[i])
+
+    '''New Normalization '''
+    scale = poses[-1,2,3]
+    print(f"scale:{scale}\n")
+    for i in range(poses.shape[0]):
+        poses[i,:3,3] = poses[i,:3,3]/scale
+        print(poses[i])
+    return poses
+
+
+def loadCameraToPose(filename):
+    # open file
+    Tr = {}
+    lastrow = np.array([0, 0, 0, 1]).reshape(1, 4)
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            lineData = list(line.strip().split())
+            if lineData[0] == 'image_01:':
+                data = np.array(lineData[1:]).reshape(3,4).astype(np.float64)
+                data = np.concatenate((data,lastrow), axis=0)
+                Tr[lineData[0]] = data
+
+    return Tr['image_01:']
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Kitti360":  readKitti360Info
 }
