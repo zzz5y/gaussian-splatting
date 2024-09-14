@@ -8,7 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import torchvision.transforms as T
 import torch
 from scene import Scene
 import os
@@ -28,11 +28,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
+    # 定义图片大小翻倍的变换
+    resize_transform = T.Resize((2 * views[0].original_image.shape[1], 2 * views[0].original_image.shape[2]))
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         rendering = render(view, gaussians, pipeline, background)["render"]
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+
+        #将渲染结果和原始图像尺寸翻倍
+        # rendering_resized = resize_transform(rendering)
+        # gt = resize_transform(view.original_image[0:3, :, :])
+        #
+        # torchvision.utils.save_image(rendering_resized, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

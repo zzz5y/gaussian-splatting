@@ -106,12 +106,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
-def fetchPly(path):
+def fetchPly(path,return_normals=True):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    if return_normals:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = None
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -333,12 +336,19 @@ def readKitti360Info(datadir, white_background=False, eval=False, factor=8):
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)
+        if os.path.exists("/media/ry/483BED215A2D2EBA/KITTI-360/colmap_points/points3D.ply"):
+            colmap_pcd = fetchPly(ply_path,return_normals=False)
+            pcd=colmap_pcd
+            #pcd_return=merge_point_clouds(pcd,colmap_pcd)
+            pcd_return=pcd
+        else:
+            pcd_return=pcd
     except:
-        pcd = None
+        pcd_return = None
 
     # Return SceneInfo
     scene_info = SceneInfo(
-        point_cloud=pcd,
+        point_cloud=pcd_return,
         train_cameras=train_cam_infos,
         test_cameras=test_cam_infos,
         nerf_normalization=nerf_normalization,
@@ -354,7 +364,8 @@ poses (是指的 c2w 的pose)
 '''
 
 def load_kitti360_data(datadir, factor=8):
-    poses, imgs, K, i_test =_load_data(datadir)
+    #poses, imgs, K, i_test =_load_data(datadir)
+    poses, imgs, K, i_test = _load_data_single(datadir)
     H,W = imgs.shape[1:3]
     focal = K[0][0]
 
@@ -420,9 +431,9 @@ def _load_data(datadir,end_iterion=424,sequence ='2013_05_28_drive_0000_sync'):
     image_00 = os.path.join(imgae_dir,'image_00/data_rect')
     image_01 = os.path.join(imgae_dir,'image_01/data_rect')
 
-    start_index = 2100
+    start_index = 3463
     #num = 8
-    num = 200
+    num = 262
     all_images = []
     all_poses = []
 
@@ -463,8 +474,110 @@ def _load_data(datadir,end_iterion=424,sequence ='2013_05_28_drive_0000_sync'):
     # i_test = sorted(selected_indices)
 
     #i_test =[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57, 59]
-    i_test = [i for i in range(200) if i % 2 == 0]
+    i_test = [i for i in range(262) if i % 3 == 0]
     return c2w,imgs, K_00,i_test
+
+
+# 处理法向量的拼接函数
+def merge_point_clouds(pcd1, pcd2):
+    # 获取第一个点云的点、颜色、法向量信息
+    points1, colors1, normals1 = pcd1.points, pcd1.colors, pcd1.normals
+    # 获取第二个点云的点、颜色、法向量信息
+    points2, colors2, normals2 = pcd2.points, pcd2.colors, pcd2.normals
+
+    # 拼接点和颜色信息
+    merged_points = np.vstack([points1, points2])
+    merged_colors = np.vstack([colors1, colors2])
+
+    if normals1 is not None and normals2 is not None:
+        # 如果两个点云都有法向量，直接拼接
+        merged_normals = np.vstack([normals1, normals2])
+    elif normals1 is not None:
+        # 只有第一个点云有法向量，第二个点云的法向量设为零向量或空值
+        zero_normals = np.zeros_like(points2)
+        merged_normals = np.vstack([normals1, zero_normals])
+    elif normals2 is not None:
+        # 只有第二个点云有法向量，第一个点云的法向量设为零向量或空值
+        zero_normals = np.zeros_like(points1)
+        merged_normals = np.vstack([zero_normals, normals2])
+    else:
+        # 两个点云都没有法向量，法向量设为None
+        merged_normals = None
+
+    # 创建一个新的点云对象，并将拼接后的数据赋值给它
+    merged_pcd = BasicPointCloud(points=merged_points, colors=merged_colors, normals=merged_normals)
+
+    return merged_pcd
+
+
+def _load_data_single(datadir, end_iterion=424, sequence='2013_05_28_drive_0000_sync'):
+    '''Load intrinstic matrix'''
+    intrinstic_file = os.path.join(os.path.join(datadir, 'calibration'), 'perspective.txt')
+    with open(intrinstic_file) as f:
+        lines = f.readlines()
+        for line in lines:
+            lineData = line.strip().split()
+            if lineData[0] == 'P_rect_00:':
+                K_00 = np.array(lineData[1:]).reshape(3, 4).astype(np.float64)
+
+    '''Load extrinstic matrix'''
+    CamPose_00 = {}
+    extrinstic_file = os.path.join(datadir, os.path.join('data_poses', sequence))
+    cam2world_file_00 = os.path.join(extrinstic_file, 'cam0_to_world.txt')
+
+    ''' Camera_00  to world coordinate '''
+    with open(cam2world_file_00, 'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            lineData = list(map(float, line.strip().split()))
+            CamPose_00[lineData[0]] = np.array(lineData[1:]).reshape(4, 4)
+
+    ''' Load images from camera 00 '''
+    def imread(f):
+        if f.endswith('png'):
+            return imageio.imread(f, format="PNG-PIL", ignoregamma=True)
+        else:
+            return imageio.imread(f, format="PNG-PIL", ignoregamma=True)
+
+    image_dir = os.path.join(datadir, sequence)
+    image_00 = os.path.join(image_dir, 'image_00/data_rect')
+
+    #start_index = 3353
+    start_index = 3463
+    num = 262
+    all_images = []
+    all_poses = []
+
+    for idx in range(start_index, start_index + num, 1):
+        # Read image_00
+        image = imread(os.path.join(image_00, "{:010d}.png").format(idx)) / 255.0
+        all_images.append(image)
+        all_poses.append(CamPose_00[idx])
+
+    imgs = np.stack(all_images, -1)
+    imgs = np.moveaxis(imgs, -1, 0)
+    c2w = np.stack(all_poses)
+
+    '''Generate test file'''
+    i_test = [i for i in range(262) if i % 2 == 0]
+    return c2w, imgs, K_00, i_test
+
+# def Normailize_T(poses):
+#     for i,pose in enumerate(poses):
+#         if i == 0:
+#             inv_pose = np.linalg.inv(pose)
+#             poses[i] = np.eye(4)
+#         else:
+#             #inv_pose = np.linalg.inv(pose)
+#             poses[i] = np.dot(inv_pose,poses[i])
+#
+#     '''New Normalization '''
+#     scale = poses[-1,2,3]
+#     print(f"scale:{scale}\n")
+#     for i in range(poses.shape[0]):
+#         poses[i,:3,3] = poses[i,:3,3]/scale
+#         print(poses[i])
+#     return poses
 
 def Normailize_T(poses):
     for i,pose in enumerate(poses):
@@ -472,13 +585,13 @@ def Normailize_T(poses):
             inv_pose = np.linalg.inv(pose)
             poses[i] = np.eye(4)
         else:
-            poses[i] = np.dot(inv_pose,poses[i])
+            poses[i] = np.dot(inv_pose, poses[i])
 
     '''New Normalization '''
-    scale = poses[-1,2,3]
-    print(f"scale:{scale}\n")
+    scale = poses[-1, 2, 3]
+    print(f"scale: {scale}\n")
     for i in range(poses.shape[0]):
-        poses[i,:3,3] = poses[i,:3,3]/scale
+        poses[i, :3, 3] = poses[i, :3, 3] / scale
         print(poses[i])
     return poses
 

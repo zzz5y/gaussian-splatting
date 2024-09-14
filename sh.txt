@@ -1,0 +1,3 @@
+conda activate gaussian_splatting
+python3 ./train.py -s /media/ry/483BED215A2D2EBA/KITTI-360 -m ./output/913_1207
+
